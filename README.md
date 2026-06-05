@@ -163,6 +163,13 @@ parameters)** distils it — recovering ~97% of the teacher's accuracy.
 
 ![distillation](visuals/4_distillation.png)
 
+Finally, [`conformal_demo.py`](conformal_demo.py) adds **trust**: instead of one
+label, it returns a *set* of labels with a coverage guarantee (the true label is
+inside ≥ 90% of the time). Confident messages get a single label; genuinely vague
+ones expand to several — an honest, mathematically-backed "route this to a human."
+
+![conformal](visuals/5_conformal.png)
+
 ---
 
 ## 7. Run it yourself
@@ -179,6 +186,9 @@ python llm_denoise.py
 
 # Tier 4 — knowledge distillation: big teacher -> tiny student (no API key needed)
 python distill_demo.py
+
+# Tier 5 — conformal prediction: calibrated sets with a coverage guarantee (no API key)
+python conformal_demo.py
 ```
 
 `clarity_engine.py` prints the accuracy comparison and writes three figures to

@@ -220,6 +220,13 @@ one element; on a vague one it returns two or three — an honest, mathematicall
 backed "it's one of these." This is one of the most practical recent advances for
 high-stakes NLP, and it composes with any underlying model.
 
+> ▶ **Runnable proof:** [`conformal_demo.py`](conformal_demo.py) implements split
+> conformal prediction with **randomised APS** (Adaptive Prediction Sets). It
+> calibrates on a held-out split, then shows the coverage guarantee holding across
+> several confidence levels and the set size *adapting* to difficulty: confident
+> messages get a single label, while a genuinely vague `"ok"` expands to four
+> candidate labels — exactly the signal to route it to a human.
+
 ### 5.3 Abstention + human-in-the-loop
 
 The model should be allowed to say *"route to a human."* Combine the confidence
