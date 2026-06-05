@@ -1,39 +1,26 @@
 """
-=============================================================================
- conformal_demo.py  —  Tier 5: trustworthy predictions with a guarantee
-=============================================================================
+Conformal prediction: return a label set with a coverage guarantee.
 
-Runnable proof of ADVANCED.md section 5.2 — conformal prediction.
+A plain classifier gives one label and a confidence number that's often poorly
+calibrated. Conformal prediction instead returns a set of labels with a
+distribution-free guarantee — the true label is in the set at least (1 - alpha)
+of the time — for any underlying model. Easy rows get a one-element set; vague
+ones get two or three, which is a useful "send this to a human" signal.
 
-A normal classifier hands you one label and a confidence number you can't
-really trust. CONFORMAL PREDICTION instead returns a SET of labels with a
-distribution-free guarantee: the true label is inside the set at least
-(1 - alpha) of the time -- e.g. 90% -- no matter what model you used or what
-the data looks like.
+Method (split conformal with randomised APS):
+  1. Fit a classifier; hold out a calibration set it didn't train on.
+  2. For each calibration row, sort class probabilities high->low and sum down to
+     the true class; that cumulative mass (with a random tie-break) is the score.
+  3. q-hat = the (1 - alpha) quantile of those scores.
+  4. For a new row, add classes high->low until cumulative prob reaches q-hat,
+     with a randomised rule on the boundary class to keep the set small.
 
-On an easy message the set has ONE element ("definitely billing"). On a
-genuinely vague message it returns TWO or THREE ("it's billing or
-cancellation") -- an honest, mathematically-backed "I'm not sure which."
-That is exactly the signal you want for routing vague cases to a human.
+Two caveats: plain (non-randomised) APS over-covered and produced bloated sets on
+this data, hence the randomised variant; and coverage still lands a bit above
+target here because the base model is accurate enough to cover with small sets.
 
-METHOD (split conformal / APS — Adaptive Prediction Sets)
----------------------------------------------------------
-  1. Fit any classifier; hold out a CALIBRATION set it didn't train on.
-  2. For each calibration row, sort the class probabilities high->low and add
-     them up until you reach the TRUE class; that cumulative mass is the score.
-  3. q-hat = the (1 - alpha) empirical quantile of those scores.
-  4. For a new x, sort classes high->low and keep adding them to the set until
-     their cumulative probability reaches q-hat.
-  Guarantee: P(true label in set) >= 1 - alpha. APS makes the set GROW on
-  ambiguous inputs and shrink to a single label on confident ones.
-
-SETUP
------
     pip install -r requirements.txt
-RUN
----
     python conformal_demo.py
-=============================================================================
 """
 
 from __future__ import annotations

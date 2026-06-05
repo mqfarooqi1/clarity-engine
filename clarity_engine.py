@@ -1,46 +1,22 @@
 """
-=============================================================================
- CLARITY ENGINE  —  turning a vague, noisy text dataset into accurate answers
-=============================================================================
+Label cleaning by similarity-weighted k-NN voting, then training on the result.
 
-THE REAL-WORLD PROBLEM
-----------------------
-Real NLP datasets are messy. Customer messages are short, ambiguous, full of
-typos, and -- crucially -- their LABELS are often wrong (a tired human tagged
-"my card was charged twice" as a *technical* issue instead of *billing*). If
-you train a model directly on those noisy labels, it learns the mistakes.
+The idea: a single label is noisy, but meaning is more stable. Embed each
+message, find its nearest neighbours, and let them vote on the label (weighted
+by cosine similarity). Random label noise scatters across classes while the true
+class stays the plurality, so the vote tends to recover the right label. Rows
+where the neighbourhood disagrees get flagged as low-confidence.
 
-How do you recover the TRUTH hidden inside a vague dataset, and train a model
-that gives the most accurate information possible?
+This is basically label propagation / a soft k-NN smoother — nothing novel, but
+easy to inspect. To check whether it helps, we train a classifier on the raw
+noisy labels vs. the corrected labels and score both on a clean held-out set.
 
-THE APPROACH:  "Semantic Consensus Denoising"
-----------------------------------------------
-A single noisy label is unreliable. But MEANING is robust. So:
+Everything runs on a synthetic dataset with uniform random label noise (the
+friendly case). For real data, swap the generator for a loader and the exact
+k-NN for an ANN index; see README.md and ADVANCED.md.
 
-   1. EMBED every message into a vector that captures its meaning.
-   2. For each message, find its nearest neighbours in meaning-space.
-   3. Let those neighbours VOTE (weighted by how similar they are). A message
-      surrounded by 'billing' neighbours is almost certainly 'billing',
-      even if its own label says otherwise.
-   4. This yields a CORRECTED label plus a CONFIDENCE score -- and it flags the
-      genuinely vague messages where even the neighbourhood disagrees.
-   5. Train the final model on the CORRECTED, high-confidence data.
-
-We then PROVE it works: a model trained on the raw noisy labels vs. a model
-trained on the consensus-corrected labels, both scored on a clean test set.
-
-Why this scales to millions of rows: embedding is a one-pass operation, and the
-neighbour search uses an approximate index (FAISS/ScaNN in production). The
-exact same pipeline runs on a real corpus -- just swap the toy generator for a
-data loader. See README.md.
-
-SETUP
------
     pip install -r requirements.txt
-RUN
----
     python clarity_engine.py
-=============================================================================
 """
 
 from __future__ import annotations

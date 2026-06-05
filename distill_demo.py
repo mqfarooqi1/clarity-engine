@@ -1,37 +1,23 @@
 """
-=============================================================================
- distill_demo.py  —  Knowledge Distillation: big teacher -> tiny student
-=============================================================================
+A small knowledge-distillation experiment: big teacher -> tiny student.
 
-Runnable proof of ADVANCED.md section 4.2 — "the best way to use an LLM to
-train for accuracy."
+The motivation, when it applies: you can't serve a large/expensive model on
+every request, so you use it once, offline, to label a pool of data with soft
+probabilities, then train a small student to imitate it. The student is cheap to
+serve and usually close to the teacher in accuracy.
 
-THE IDEA
---------
-You can't serve a frontier LLM on every production request (too slow, too
-expensive). So you use it ONCE, offline, as a TEACHER: it labels a large pool
-of data with SOFT probabilities (not just a single answer). Then you train a
-small, fast STUDENT to imitate those soft labels. The student ends up nearly as
-accurate as the teacher, but tiny enough to serve cheaply.
+The textbook claim is that soft labels (a full distribution) beat hard labels (an
+argmax) because they carry inter-class information. That showed up here, but only
+once the student was small enough to be capacity-limited; on the easy, separable
+version the two were a wash. So it's a real effect, just smaller and more
+situational than it's sometimes presented.
 
-The key insight this demo proves: a soft label like
-    {billing: 0.80, cancellation: 0.15, technical: 0.05}
-teaches the student the *geometry* between classes — far more signal than a
-hard label that just says "billing". A student trained on soft labels beats an
-identical student trained on hard labels.
+To keep this runnable with no API key, the "teacher" is a logistic regression on
+the full 384-d embeddings — a stand-in for the expensive model. The student is a
+tiny linear softmax on 8-d compressed features.
 
-In the REAL pipeline the teacher is the Claude Opus 4.8 adjudicator in
-llm_denoise.py. Here, so it runs offline with no API key, the teacher is a
-strong classifier on the full 384-d embeddings — it plays the same role:
-an accurate, expensive model whose knowledge we compress into a small one.
-
-SETUP
------
     pip install -r requirements.txt
-RUN
----
     python distill_demo.py
-=============================================================================
 """
 
 from __future__ import annotations

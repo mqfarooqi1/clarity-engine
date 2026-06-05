@@ -1,314 +1,215 @@
-# Advanced Guide — Extracting Accurate Information from Vague Data, and Training the Best Model with an LLM
+# Notes: cleaning noisy labels and what to train on
 
-This is the deep-dive companion to [`README.md`](README.md). The README shows a
-single technique (Semantic Consensus Denoising) end to end. This document maps
-the **whole modern playbook** — from cheap statistical denoising to LLM-in-the-loop
-relabelling, knowledge distillation, and calibrated, abstaining models — and ends
-with a concrete recommendation for **the best way to use an LLM to train for
-maximum accuracy.**
+These are my longer notes behind the scripts in this repo — the stuff that
+didn't fit in the README. It's a survey of the approaches I considered for
+"the labels are wrong, what now," roughly in the order I'd actually reach for
+them, plus where an LLM fits. Nothing here is novel; it's me writing down the
+standard playbook so I remember it, with pointers to the small demos that make
+each piece concrete.
 
-> Honesty up front: the individual building blocks below are established
-> techniques (confident learning, label propagation, distillation, conformal
-> prediction, LoRA). What's advanced is **how they compose into one pipeline** —
-> cheap methods clean the easy 90%, an LLM adjudicates the genuinely ambiguous
-> 10%, and the final model trains on the result with calibrated confidence and an
-> "I don't know" option.
+Standard caveat: everything in this repo runs on synthetic data with uniform
+random label noise, which is the friendly case. Real noise is correlated with
+class and with hard examples, so treat the numbers as illustrative.
 
 ---
 
-## 0. The core idea: this is a *data* problem, not a *model* problem
+## Start by treating it as a data problem
 
-The instinct when accuracy is low is to reach for a bigger model. On vague,
-mislabelled data that's usually the wrong lever. If 30–50% of your labels are
-wrong, a larger model just learns the mistakes more faithfully. **The highest-ROI
-move is almost always to fix the labels before training.** Everything below is
-about doing that correctly, cheaply, and at scale.
+When accuracy is low on noisy labels, the reflex is to reach for a bigger model.
+Usually that's the wrong lever — a bigger model just fits the wrong labels more
+faithfully. Fixing the labels first tends to pay off more for less effort. The
+rest of these notes are about doing that without spending a fortune.
+
+The cheap framing that organises everything below: **route work by difficulty.**
+Don't send every row to an expensive LLM. Use cheap methods first and escalate
+only what they can't resolve.
 
 ```
-        ┌─────────────────────────────────────────────────────────────┐
-        │  Raw, vague, mislabelled corpus  (millions of rows)          │
-        └───────────────┬─────────────────────────────────────────────┘
-                        ▼
-   TIER 1  Embed + neighbour consensus   ───►  fixes the easy, dense cases (cheap)
-                        ▼
-   TIER 2  Confident Learning            ───►  statistically flags likely errors
-                        ▼
-   TIER 3  LLM adjudication (the hard 10%) ──►  reasons through genuine ambiguity
-                        ▼
-   TIER 4  Train final model on clean labels ► frozen encoder + head, or distil
-                        ▼
-   TIER 5  Calibrate + abstain + conformal ──► trustworthy, with an "unsure" path
+   raw noisy corpus
+        │
+        ▼  cheap: embed + neighbour voting        -> fixes the dense, easy cases
+        ▼  cheap: confident learning              -> flags likely errors statistically
+        ▼  expensive: LLM on the hard residual    -> reasons through real ambiguity
+        ▼  train the final model on what's left
+        ▼  calibrate + allow "unsure"             -> trustworthy, with a human fallback
 ```
 
-The key economic insight: **route work by difficulty.** Don't send every row to an
-expensive LLM. Send the cheap methods first; escalate only what they can't resolve.
+---
+
+## 1. Embedding + neighbour voting (the cheap workhorse)
+
+Covered in the README and implemented in `clarity_engine.py`. Embed everything,
+find each row's nearest neighbours, let them vote on the label weighted by
+similarity. Random noise averages out; the true class stays the plurality.
+
+- Cheap, and it handles the dense, unambiguous majority.
+- It fails exactly where the data is genuinely vague — sparse regions, very short
+  messages, boundary cases. Those show up as low-confidence rows, which is the
+  natural hand-off point to the LLM step.
+
+This is essentially label propagation / a soft k-NN smoother. I like it because
+it's easy to inspect, not because it's clever.
 
 ---
 
-## 1. Tier 1 — Embedding + neighbour consensus (the cheap workhorse)
+## 2. Confident learning (a second opinion)
 
-Covered in the README. Embed every example, find each one's nearest neighbours in
-meaning-space, and let them vote (similarity-weighted) on the label. Random label
-noise averages out; the true class stays the plurality.
+[Confident Learning](https://arxiv.org/abs/1911.00068) (the method in `cleanlab`)
+estimates the joint distribution of noisy-vs-true labels from a model's
+out-of-fold predicted probabilities, then ranks which specific rows are most
+likely mislabelled. It's a useful cross-check on the neighbour method: one uses
+geometry, the other uses a model's probabilities. Where they agree, I'd trust the
+correction; where they disagree, that's a candidate for human review or the LLM.
 
-- **Strength:** near-zero marginal cost, fixes the dense, unambiguous majority.
-- **Weakness:** fails exactly where the data is *genuinely* vague — sparse regions,
-  short messages, examples that sit on a cluster boundary. Those are the cases the
-  consensus flags as *low-confidence*. That flag is the hand-off to Tier 3.
-
----
-
-## 2. Tier 2 — Confident Learning (find label errors statistically)
-
-[Confident Learning](https://arxiv.org/abs/1911.00068) (the method behind
-`cleanlab`) estimates the **joint distribution between noisy observed labels and
-latent true labels** using a model's own out-of-sample predicted probabilities. It
-then ranks which specific examples are most likely mislabelled — without you ever
-seeing ground truth.
-
-The recipe:
-1. Train a quick classifier with cross-validation to get out-of-fold predicted
-   probabilities for every row.
-2. For each class pair *(given = i, likely-true = j)*, find examples confidently
-   predicted *j* but labelled *i*.
-3. Rank and prune (or relabel) the highest-probability errors.
-
-This is complementary to Tier 1: consensus uses *geometry* (neighbours), confident
-learning uses *a model's calibrated probabilities*. Agreement between the two is a
-strong signal an example is genuinely mislabelled; disagreement is a candidate for
-Tier 3.
+I didn't wire this in (it's a one-liner with `cleanlab` if you want it), but it's
+the obvious next thing to add.
 
 ---
 
-## 3. Tier 3 — LLM-in-the-loop (the part most teams get wrong)
+## 3. Using an LLM for the part that's actually hard
 
-This is where a frontier LLM earns its cost — **not** by relabelling the whole
-dataset (expensive and unnecessary), but by adjudicating the residual cases the
-cheap tiers couldn't resolve. The implementation lives in
-[`llm_denoise.py`](llm_denoise.py).
+The cheap tiers leave a residual of genuinely ambiguous rows. That's where an LLM
+earns its cost — not relabelling the whole dataset, which is slow and expensive,
+but adjudicating the cases the cheap methods couldn't. Implemented in
+`llm_denoise.py`.
 
-### 3.1 LLM-as-judge relabelling
+A few things that make this usable rather than a science project:
 
-Give the model the ambiguous message, the **label taxonomy with definitions**, and
-— critically — **the nearest-neighbour examples and their labels as context**. Ask
-it to assign the correct label *with reasoning*. The neighbour context turns a
-blind guess into an informed decision and grounds the model in your actual data
-distribution.
+- **Give it the taxonomy with definitions and the row's neighbours as context.**
+  The neighbours ground the model in your actual data instead of its priors.
+- **Structured outputs.** Constrain the response to a schema with the label as an
+  enum (plus an `"uncertain"` option). You get a valid label every time, no regex
+  parsing.
+- **Let it abstain.** Force a confidence and allow "uncertain." Anything below a
+  threshold goes to a human rather than being silently guessed.
+- **Self-consistency for the worst cases.** Sample a few times and take the
+  majority; the spread is a rough uncertainty signal.
+- **Spend the budget where it moves the needle.** Rank the unresolved pool by
+  uncertainty and send the LLM the top of the list. A few thousand good
+  adjudications usually recover most of what a full relabel would, far cheaper.
 
-### 3.2 Make the output reliable: structured outputs + adaptive thinking
-
-Two non-negotiables for production:
-
-- **Structured outputs** (`output_config.format` / `messages.parse()` with a
-  schema) guarantee the response is valid JSON matching your label set — no regex
-  parsing, no "the model wrote prose instead of a label." Use an `enum`/`Literal`
-  so the label is provably one of your classes (or `"uncertain"`).
-- **Adaptive thinking** (`thinking: {"type": "adaptive"}` on Opus 4.8) lets the
-  model reason through genuinely ambiguous cases and *decide for itself* how much
-  reasoning each one needs — short for easy calls, deep for hard ones.
-
-### 3.3 Self-consistency for the hardest cases
-
-For the messages even the LLM finds borderline, sample the judgment a few times and
-take the majority (or average the confidences). [Self-consistency](https://arxiv.org/abs/2203.11171)
-measurably improves accuracy on ambiguous reasoning and, as a bonus, the spread of
-the samples is itself a calibrated uncertainty signal.
-
-### 3.4 Calibrated confidence + abstention
-
-Force the model to emit a confidence and allow an `"uncertain"` verdict. Anything
-below a threshold is **not** auto-labelled — it's queued for a human. This is the
-difference between a pipeline that quietly fabricates labels and one that knows
-what it doesn't know.
-
-### 3.5 Active learning: spend the LLM budget where it moves accuracy
-
-Rank the unresolved pool by *uncertainty* (low consensus confidence, high neighbour
-disagreement, Tier-1/Tier-2 conflict) and send the LLM the top of that list first.
-A few thousand well-chosen adjudications typically recover most of the accuracy a
-full relabel would — at a fraction of the cost. This closes the loop: LLM verdicts
-become new "anchors" that re-strengthen the cheap consensus for everything nearby.
+`llm_denoise.py` uses Claude with adaptive thinking, schema-constrained output,
+neighbour context, prompt caching on the fixed instructions, and an abstain path.
 
 ---
 
-## 4. Tier 4 — Training the final model: the modern recipe
+## 4. What to actually train
 
-Once the labels are clean, *what* do you train? Three tiers of ambition.
+Once the labels are reasonable:
 
-### 4.1 Baseline (do this first): frozen encoder + lightweight head
+### 4.1 Start simple: frozen encoder + light head
 
-A pretrained sentence-transformer (frozen) turns text into vectors; a logistic
-regression / small MLP on top does the classification. This is what the README
-demo trains, and it already hits 90%+. The representation does the heavy lifting;
-the head is cheap, fast, and retrainable in seconds when labels change.
+A pretrained sentence-transformer (frozen) plus a logistic-regression or small-MLP
+head. This is what the README trains and it already gets ~90%. The representation
+does the work; the head is cheap and retrains in seconds. Do this first.
 
-### 4.2 The best accuracy/cost trade-off: **LLM-as-teacher knowledge distillation**
+### 4.2 If you need small-and-fast in production: distillation
 
-This is the single most important answer to *"what's the best way to use an LLM to
-train for accuracy?"*
+You can't serve a frontier LLM on every request, but you can use it once, offline,
+as a teacher to label a large pool with soft probabilities, then train a small
+student to imitate those. The student ends up cheap to serve and close to the
+teacher in accuracy.
 
-You can't serve a frontier LLM on every request in production — too slow, too
-expensive. But you can use it **once, offline, as a teacher** to create a clean,
-richly-labelled training set, then **distil** that knowledge into a small, fast
-"student" model you own:
+The often-quoted advantage of *soft* labels over hard ones (the probability
+distribution carries inter-class information a hard label throws away) is real but,
+in my experience here, smaller and more situational than the literature suggests —
+see the demo note below.
 
-```
-   Frontier LLM (teacher)
-        │  labels + soft probabilities + rationales, offline, on a big unlabelled pool
-        ▼
-   Clean, large, high-quality training set
-        │  train once
-        ▼
-   Small student model (MiniLM head, or a fine-tuned small transformer)
-        │  serve in production: milliseconds, cents
-        ▼
-   LLM-level accuracy at small-model cost and latency
-```
+> `distill_demo.py` runs this: a 384-d teacher labels the pool with
+> temperature-softened probabilities, and a tiny 8-d student (~45 params) imitates
+> it, recovering ~97% of the teacher's accuracy. The soft-label student only beat
+> the hard-label one once the student was small enough to be capacity-limited; on
+> the easy, separable version they were a wash. So the soft-label benefit showed
+> up, but it's not the headline it's sometimes made out to be.
 
-Why it wins:
-- **Soft labels carry more signal than hard labels.** The teacher's probability
-  distribution ("80% billing, 15% cancellation, 5% technical") teaches the student
-  the class *geometry*, not just the answer — a well-known distillation result.
-- **You amortise the LLM cost.** Pay the teacher once; serve the student forever.
-- **You can generate data, not just label it.** Have the teacher write realistic
-  paraphrases to densify sparse regions and rare intents (LLM augmentation), then
-  label those too.
+### 4.3 If a frozen head plateaus: fine-tune small (LoRA/QLoRA)
 
-> ▶ **Runnable proof:** [`distill_demo.py`](distill_demo.py) demonstrates this end
-> to end — a big teacher (384-d) labels the pool with temperature-softened soft
-> probabilities, and a tiny student (8-d, **~40× fewer parameters**) distils it,
-> recovering ~97% of the teacher's accuracy. The student trained on **soft** labels
-> edges out an identical student trained on hard labels — the soft distribution
-> carries inter-class "dark knowledge" that a hard argmax throws away. The gap
-> widens as the teacher gets less certain and the student more capacity-limited.
+Parameter-efficient fine-tuning of a small transformer on the cleaned labels.
+Cheap (you train a few adapter layers, not the whole model), and worth it only
+after 4.1 and 4.2 stop improving. Smallest lever, most effort.
 
-### 4.3 When you need the last few points: fine-tune a small transformer (LoRA/QLoRA)
+### 4.4 If you have no labels at all: weak supervision
 
-If a frozen encoder + head plateaus, fine-tune a small transformer end-to-end on
-the cleaned/distilled labels. **LoRA / QLoRA** (parameter-efficient fine-tuning)
-make this cheap: you train a few million adapter parameters instead of the whole
-model, on a single GPU. Reach for this only after 4.1 and 4.2 — it's the smallest
-lever for the most effort.
-
-### 4.4 Weak supervision when you have *no* labels
-
-If you're starting from an unlabelled pile, programmatic weak supervision
-([Snorkel](https://www.snorkel.org/)) lets you write noisy *labelling functions*
-(keyword rules, regexes — and now **LLM labelling functions**) and a label model
-that reconciles their agreements/disagreements into probabilistic training labels.
-LLMs make excellent labelling functions: cheap to write, broad coverage.
+[Snorkel](https://www.snorkel.org/)-style: write noisy labelling functions (rules,
+regexes, and now LLM prompts) and let a label model reconcile them into
+probabilistic labels. LLMs make good labelling functions — cheap to write, broad
+coverage.
 
 ---
 
-## 5. Tier 5 — Make the model *trustworthy*, not just accurate
+## 5. Making the model trustworthy, not just accurate
 
-Accuracy without calibration is dangerous: a model that's 70% accurate but reports
-99% confidence everywhere will mislead every downstream decision.
+A model that's 70% accurate but reports 99% confidence everywhere is worse than
+useless downstream.
 
-### 5.1 Calibration (temperature scaling)
+### 5.1 Calibration
 
-After training, fit a single temperature parameter on a held-out set so the
-predicted probabilities match observed accuracy. Measure it with **Expected
-Calibration Error (ECE)**. Cheap, and it makes confidence scores mean something.
+Fit a single temperature parameter on a held-out set so predicted probabilities
+match observed accuracy, and measure it with Expected Calibration Error (ECE).
+Cheap, and it's the difference between confidence scores that mean something and
+ones that don't. I didn't implement it here; I should have.
 
-### 5.2 Conformal prediction (the rigorous, modern option)
+### 5.2 Conformal prediction
 
-[Conformal prediction](https://arxiv.org/abs/2107.07511) gives a **distribution-free
-coverage guarantee**: instead of one label, it returns a *set* of labels guaranteed
-to contain the true one with, say, 95% probability. On an easy message the set has
-one element; on a vague one it returns two or three — an honest, mathematically
-backed "it's one of these." This is one of the most practical recent advances for
-high-stakes NLP, and it composes with any underlying model.
+[Conformal prediction](https://arxiv.org/abs/2107.07511) gives a distribution-free
+coverage guarantee: instead of one label it returns a set that contains the true
+label with, say, 90% probability. Easy rows get a one-element set; vague ones get
+two or three. It wraps any model.
 
-> ▶ **Runnable proof:** [`conformal_demo.py`](conformal_demo.py) implements split
-> conformal prediction with **randomised APS** (Adaptive Prediction Sets). It
-> calibrates on a held-out split, then shows the coverage guarantee holding across
-> several confidence levels and the set size *adapting* to difficulty: confident
-> messages get a single label, while a genuinely vague `"ok"` expands to four
-> candidate labels — exactly the signal to route it to a human.
+> `conformal_demo.py` implements split conformal with randomised APS. Coverage
+> holds across a few confidence levels, and set size adapts — confident messages
+> get a single label, a vague "ok" expands to several. Two honest notes: plain
+> (non-randomised) APS over-covered and produced bloated sets on this data, which
+> is why I used the randomised variant; and coverage still runs a little above
+> target because the base model is accurate enough to cover with small sets.
 
 ### 5.3 Abstention + human-in-the-loop
 
-The model should be allowed to say *"route to a human."* Combine the confidence
-threshold (5.1), a large conformal set (5.2), or low neighbour consensus into an
-abstain signal. The abstained cases are exactly your next active-learning batch —
-the loop closes again.
+Let the model route to a human. Combine a low confidence, a large conformal set,
+or low neighbour consensus into an abstain signal. The abstained rows are exactly
+your next batch to label by hand — which feeds back into step 3.
 
 ---
 
-## 6. Scaling all of this to large, real-world datasets
+## 6. Scaling to real datasets
 
-The README pipeline runs on a toy set in seconds; the same code runs on millions of
-rows with four changes:
+The scripts run on a toy set in seconds. The same code runs on millions of rows
+with a few changes:
 
-| Concern | At toy scale | At production scale |
-|---|---|---|
-| Nearest neighbours | exact (`O(n²)`) | **ANN index** — FAISS / ScaNN / hnswlib, sub-linear |
-| Embedding | one CPU pass | **GPU batch** `encode(..., batch_size=256, device="cuda")`, cached to disk |
-| LLM adjudication | one call per row | **Batches API** (50% cheaper, async) + **prompt caching** on the shared taxonomy/instructions |
-| Storage | NumPy array | a **vector database**; shard and stream |
-
-Two cost multipliers worth calling out:
-- **Prompt caching:** the taxonomy, definitions, and few-shot examples are
-  identical across every LLM call — cache that prefix and pay ~0.1× for it on every
-  subsequent request. (`llm_denoise.py` places the `cache_control` breakpoint on
-  the stable system prefix for exactly this reason.)
-- **Batch processing:** label-cleaning is not latency-sensitive — run it through
-  the Batches API at half price.
+- **Nearest neighbours:** swap exact k-NN for an ANN index (FAISS / ScaNN /
+  hnswlib) past ~100k rows.
+- **Embedding:** batch on a GPU and cache the vectors; you only embed once.
+- **LLM step:** use the Batches API (about half price, async) and prompt-cache the
+  shared taxonomy/instructions — that prefix is identical on every call.
+- **Storage:** a vector DB; shard and stream.
 
 ---
 
-## 7. The recommended end-to-end pipeline ("the best way")
+## 7. How I'd measure whether any of this helped
 
-Putting it all together, here is the pipeline I'd actually ship:
-
-1. **Embed** the whole corpus once (GPU, cached). Build an ANN index.
-2. **Tier 1 consensus** to correct the dense, easy majority and produce a
-   per-row confidence.
-3. **Tier 2 confident learning** to cross-check and surface statistical label
-   errors. Where Tier 1 and Tier 2 agree → trust it.
-4. **Tier 3 LLM adjudication** (Opus 4.8, structured outputs, adaptive thinking,
-   neighbour context, prompt-cached prefix, Batches API) on the **uncertain
-   residual only**, ranked by an active-learning score. Allow abstention.
-5. **Tier 4 train**: start with a frozen-encoder head on the cleaned labels; if you
-   need production-grade speed *and* accuracy, **distil the LLM teacher into a small
-   student** (4.2); fine-tune with LoRA (4.3) only if you must.
-6. **Tier 5 calibrate** (temperature scaling), wrap predictions in **conformal
-   sets**, and **abstain** below threshold — feeding abstentions back to step 4.
-
-This is the synthesis the Clarity Engine is built around: **cheap methods for the
-easy cases, a frontier LLM for the genuinely hard ones, and a small, calibrated,
-abstaining model in production.**
+- **Clean held-out accuracy** on a small, carefully-labelled gold set the cleaning
+  pipeline never touches. This is the number that matters; everything else is a
+  proxy.
+- **Label-recovery rate** on synthetically corrupted data (what the README
+  reports).
+- **Calibration (ECE)** — are the confidences honest?
+- **Coverage and set size** if you use conformal.
+- **Cost per corrected label** — the metric that decides whether the LLM tier is
+  worth turning on.
 
 ---
 
-## 8. How to measure that any of this worked
+## 8. Things that bit me / things to watch
 
-- **Clean held-out accuracy.** Keep a small, carefully-labelled gold test set the
-  cleaning pipeline never touches. This is the only number that matters.
-- **Label-recovery rate.** On synthetically corrupted data (as the README demo
-  does), measure what fraction of corrupted labels you put back correctly.
-- **Calibration (ECE).** Are the confidences honest?
-- **Coverage & set size** (if using conformal). Does the 95% set actually contain
-  the truth 95% of the time, and how big is it?
-- **Cost per corrected label.** The metric that decides whether the LLM tier is
-  worth it — it usually is, *because* you only send it the hard cases.
+- Relabelling everything with the LLM is wasteful. Triage first.
+- Don't trust LLM labels blind — require structured output, a confidence, and an
+  abstain option, and spot-check against gold.
+- Keep the gold test set away from the cleaner, or you'll fool yourself.
+- The soft-label distillation benefit is data- and capacity-dependent; don't
+  assume it.
+- Uncalibrated confidence is the quiet failure mode. Calibrate, and allow "unsure."
 
 ---
 
-## 9. Pitfalls
-
-- **Relabelling everything with the LLM.** Wasteful. Triage first.
-- **Trusting LLM labels blindly.** Require structured output + confidence + an
-  abstain option; spot-check against gold.
-- **Leaking the test set.** The gold set must never pass through the cleaner.
-- **Over-fitting to the teacher's quirks.** Distil from a *diverse* teacher set and
-  validate the student on gold, not on teacher labels.
-- **Uncalibrated confidence.** A confident wrong model is worse than an unsure one.
-  Calibrate and allow abstention.
-
----
-
-Built by [Muhammad Farooqi](https://github.com/mqfarooqi1). See
-[`clarity_engine.py`](clarity_engine.py) for Tiers 1 & 4 and
-[`llm_denoise.py`](llm_denoise.py) for the Tier 3 LLM adjudicator.
+Muhammad Farooqi · https://github.com/mqfarooqi1 · see `clarity_engine.py`,
+`llm_denoise.py`, `distill_demo.py`, and `conformal_demo.py` for the code.

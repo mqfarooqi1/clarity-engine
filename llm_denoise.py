@@ -1,37 +1,28 @@
 """
-=============================================================================
- llm_denoise.py  —  Tier 3 of the Clarity Engine: LLM adjudication
-=============================================================================
+Relabel the ambiguous residual with an LLM.
 
-The cheap tiers (semantic consensus, confident learning) clean the easy,
-dense majority of a vague dataset. What's left is the genuinely ambiguous
-residual -- short, contradictory, or boundary cases where neighbour voting
-gives a low-confidence answer.
+The k-NN voting in clarity_engine.py handles the dense, easy cases. What's left
+is the genuinely ambiguous rows — short, contradictory, or boundary cases where
+the neighbourhood vote is low-confidence. The point of using an LLM here is to
+spend it only on that residual, not on the whole dataset.
 
-This module sends ONLY that residual to a frontier LLM (Claude Opus 4.8) to
-adjudicate. It is the expensive-but-precise layer, used sparingly. See
-ADVANCED.md for where this fits in the full pipeline.
+For each message it sends Claude the row, the label taxonomy with definitions,
+and the row's noisy neighbours as context, and asks for a label. A few details
+that make it usable:
 
-Best practices baked in (see ADVANCED.md §3):
-  * STRUCTURED OUTPUTS  - the label is provably one of your classes or
-    "uncertain"; no regex parsing of free text.
-  * ADAPTIVE THINKING   - Opus 4.8 decides how much to reason per case.
-  * NEIGHBOUR CONTEXT   - the message is judged alongside its semantic
-    neighbours and their labels, grounding the model in your data.
-  * PROMPT CACHING      - the taxonomy + instructions are identical on every
-    call, so the stable prefix is cached (~0.1x cost on repeat calls).
-  * ABSTENTION          - low-confidence cases return "uncertain" and are
-    routed to a human instead of being silently fabricated.
+  * Structured output — the label is constrained to the known classes or
+    "uncertain", so you always get a valid value and never parse free text.
+  * Adaptive thinking — lets the model spend more reasoning on hard rows.
+  * Neighbour context — grounds the decision in your data, not the model's priors.
+  * Prompt caching — the taxonomy/instructions are identical every call, so that
+    prefix is cached on repeat requests.
+  * Abstention — low-confidence rows return "uncertain" and route to a human.
 
-SETUP
------
+For large jobs you'd run this through the Batches API rather than a loop.
+
     pip install anthropic pydantic
     set ANTHROPIC_API_KEY=...        (PowerShell:  $env:ANTHROPIC_API_KEY="...")
-
-RUN A QUICK DEMO
-----------------
     python llm_denoise.py
-=============================================================================
 """
 
 from __future__ import annotations
