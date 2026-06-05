@@ -1,215 +1,144 @@
-# Clarity Engine 🔍✨
+# clarity-engine
 
-### Turning a vague, noisy text dataset into the most accurate information possible.
+A weekend project on a problem I keep running into at work: you're handed a pile
+of text with labels, and a good chunk of the labels are wrong. Before you train
+anything, it's worth trying to clean them up. This repo is me working through a
+few approaches end to end and seeing how far each one actually gets.
 
-A complete, runnable NLP project that tackles one of the hardest real-world
-problems in machine learning: **your data is messy and your labels are wrong —
-so how do you recover the truth and train a model you can trust?**
+Everything here runs on a **synthetic** dataset I generate in-process, so the
+numbers below are best read as "this is the shape of the effect," not as
+production benchmarks. Real label noise is rarely as well-behaved as the uniform
+random corruption I inject here.
 
-It demonstrates an advanced technique I call **Semantic Consensus Denoising**,
-and *proves* it works: with nearly half the labels corrupted, it recovers
-**86% of them** and lifts model accuracy from **84% → 93%**.
+## What's in here
 
----
+| Script | What it does | Needs an API key? |
+|---|---|---|
+| `clarity_engine.py` | k-NN label correction, then trains a classifier on the cleaned labels | no |
+| `distill_demo.py` | toy knowledge-distillation: big model labels data, tiny model imitates it | no |
+| `conformal_demo.py` | conformal prediction — returns label *sets* with a coverage guarantee | no |
+| `llm_denoise.py` | uses an LLM (Claude) to relabel only the genuinely ambiguous cases | yes |
+| `ADVANCED.md` | notes on how these pieces fit together and what I'd do at scale | — |
 
-## 1. The problem: real NLP data is vague
+## The setup
 
-In the real world you rarely get clean, well-labelled text. Customer messages,
-support tickets, survey responses and chat logs are:
+The generator makes ~930 short "customer messages" across 5 intents (billing,
+technical, shipping, cancellation, praise), adds the kind of mess real text has
+(typos, lowercasing, padding, some genuinely vague one-word messages), and then
+**flips ~45% of the labels to random other classes** to simulate sloppy
+annotation. I keep a clean held-out test set to score against.
 
-- **short and ambiguous** — `"this is not working"`, `"help"`, `"see above"`
-- **full of noise** — typos, slang, inconsistent casing
-- **badly labelled** — a rushed human tagged *"my card was charged twice"* as
-  `technical` instead of `billing`. At scale, **20–50% of labels can be wrong.**
+The core idea is unremarkable and that's fine: a single label is noisy, but
+*meaning* is more stable. Two messages about double-charges land near each other
+in embedding space even if one is mislabelled, so you can use a message's
+neighbours to second-guess its label.
 
-If you train a classifier directly on those labels, it faithfully learns the
-mistakes. Garbage in, garbage out. We need to recover the signal first.
+## Label cleaning: similarity-weighted k-NN voting
 
-> **Key insight:** a single *label* is unreliable, but *meaning* is robust. Two
-> messages about double-charges sit close together in meaning-space even if one
-> is mislabelled. We can exploit that geometry to fix the labels.
+`clarity_engine.py` embeds every message with `all-MiniLM-L6-v2`, finds each
+message's nearest neighbours by cosine similarity, and lets them vote on the
+label (weighted by similarity). This is basically label propagation / a soft
+k-NN smoother — nothing novel, but it's easy to inspect and it works because
+random noise scatters across classes while the true class stays the plurality.
 
----
+What I saw on this synthetic data (≈45% of labels corrupted):
 
-## 2. The approach: Semantic Consensus Denoising
+| Trained on | Accuracy on the clean test set |
+|---|---|
+| the raw noisy labels | ~84% |
+| consensus-corrected labels | ~90% |
+| corrected + dropping low-confidence rows | ~93% |
 
-```
-   raw messy text
-        │
-        ▼
- ┌──────────────┐   1. EMBED each message into a 384-d meaning vector
- │  embeddings  │      (sentence-transformers, all-MiniLM-L6-v2)
- └──────┬───────┘
-        ▼
- ┌──────────────┐   2. For each message, find its k nearest neighbours
- │  kNN  graph  │      in meaning-space (cosine similarity)
- └──────┬───────┘
-        ▼
- ┌──────────────┐   3. Neighbours VOTE for the label, weighted by similarity.
- │  consensus   │      A point ringed by 'billing' neighbours becomes 'billing'
- │   voting     │      → corrected label + confidence + a flag for vague cases
- └──────┬───────┘
-        ▼
- ┌──────────────┐   4. TRAIN the final model on the corrected, high-confidence
- │ trusted model│      data → accurate predictions on unseen text
- └──────────────┘
-```
+About 86% of the corrupted labels got flipped back to the right class without
+ever seeing ground truth. Two caveats worth stating plainly:
 
-### Why it works (the intuition)
+- Logistic regression on these embeddings is already fairly noise-robust, so the
+  raw baseline is higher than you'd expect. The gain from cleaning is real but
+  modest, and it would look different under non-random (systematic) noise.
+- The confidence "gate" helps partly by throwing away hard examples, which is
+  cheating a little if your real goal is coverage. Worth measuring both ways.
 
-Label noise that is *random* gets averaged out by the neighbourhood. If a point's
-true class is `billing`, then even when half its neighbours are mislabelled, the
-mislabels scatter across the *other* classes while the correct label stays the
-single largest block. Similarity-weighting sharpens this further: closer
-neighbours (more semantically identical) get a bigger vote.
-
-This is closely related to **label propagation**, **confident learning**, and
-**weak supervision** — but framed as a transparent, inspectable voting step you
-can visualise.
-
----
-
-## 3. The results (proof, not promises)
-
-The script builds a dataset of 930 customer messages across 5 intents, corrupts
-about half the labels, then runs the pipeline. Everything below is generated by
-`clarity_engine.py`.
-
-**Step 1 — The dataset is vague: meaning is clean, labels are not.**
 ![problem](visuals/1_problem.png)
-
-**Step 2 — Neighbour voting recovers the corrupted labels.**
 ![denoising](visuals/2_denoising.png)
-
-**Step 3 — A model trained on corrected data is far more accurate.**
 ![results](visuals/3_results.png)
 
-| Model trained on… | Accuracy on clean test set |
-|---|---|
-| Raw noisy labels | ~84% |
-| Consensus-corrected labels | ~90% |
-| Corrected **+ confidence gate** | **~93%** |
+## On the model choice
 
-Roughly **86% of the corrupted labels were put back correctly** — without ever
-seeing the ground truth.
+Two things mattered more than the classifier itself:
 
----
+1. The embedding does the heavy lifting. A frozen sentence-transformer + a plain
+   logistic-regression head gets you most of the way; swapping the head for an
+   SVM or small MLP barely moves it.
+2. Fixing the labels was a bigger lever than changing the model. Same classifier,
+   cleaner labels, ~9 points.
 
-## 4. What model to train, and why
+## The other three scripts (smaller experiments)
 
-Two decisions matter most for accuracy:
+These are short demos of standard techniques, included because the "clean the
+labels, then decide what to train" story naturally leads into them. None of them
+is doing anything novel.
 
-1. **Representation > classifier.** The heavy lifting is done by the *embedding
-   model* (a pretrained transformer). On top of strong embeddings, even a simple
-   **logistic regression** reaches 90%+. This is the modern recipe: a powerful
-   frozen encoder + a lightweight head. (Swap in an SVM, gradient-boosted trees,
-   or a small MLP — the embedding is what counts.)
-2. **Clean the labels before training, not the architecture after.** Most teams
-   reach for a bigger model. The bigger lever is usually *fixing the data*: the
-   confidence-gated, consensus-corrected model here beats the raw one by ~9
-   points with the *same* classifier.
-
----
-
-## 5. Scaling to large, real-world datasets
-
-The demo uses a generated dataset so it runs offline in seconds, but the
-pipeline is the *same one* you would run on millions of real rows:
-
-- **Swap the data source.** Replace the toy generator with your loader
-  (CSV, a data warehouse, `datasets.load_dataset(...)`). Nothing else changes.
-- **Approximate nearest neighbours.** Exact kNN is O(n²). In production, build an
-  ANN index (**FAISS**, **ScaNN**, or **hnswlib**) so neighbour lookup stays
-  sub-linear at millions of vectors.
-- **Batch + GPU embedding.** `model.encode(..., batch_size=256, device="cuda")`
-  embeds large corpora quickly; embeddings are computed once and cached.
-- **Stream it.** Embed in shards, store vectors in a vector DB, and run consensus
-  per shard or globally via the ANN index.
-
----
-
-## 6. Going further: LLM-in-the-loop + the full playbook
-
-The consensus method above is the cheap, high-volume layer. The genuinely
-ambiguous residual it can't resolve is where a **frontier LLM** earns its cost —
-not by relabelling everything, but by adjudicating only the hard cases.
-
-📚 **[`ADVANCED.md`](ADVANCED.md) is the deep-dive** — the complete modern playbook
-for turning vague data into accurate models and **the best way to use an LLM to
-train for maximum accuracy**, covering:
-
-- **Tiered denoising** — semantic consensus → confident learning → LLM adjudication,
-  routing work by difficulty so you only spend LLM budget where it moves accuracy.
-- **LLM-as-judge relabelling** with structured outputs, adaptive thinking,
-  self-consistency, and **calibrated abstention** (the model can say *"I'm unsure"*).
-- **Knowledge distillation** — use a frontier LLM *once, offline, as a teacher* to
-  build a clean training set, then distil it into a small, fast student you serve in
-  production: **LLM-level accuracy at small-model cost.** (This is the headline
-  answer to "what's the best way to train with an LLM.")
-- **LoRA/QLoRA fine-tuning**, **weak supervision** (Snorkel + LLM labelling functions),
-  **temperature-scaling calibration**, and **conformal prediction** (a 95%-coverage
-  guarantee on predictions) for trustworthy, abstaining models.
-- **Scaling**: ANN indexes, GPU batch embedding, the **Batches API** (50% cheaper),
-  and **prompt caching** on the shared taxonomy.
-
-A real, runnable implementation of the LLM adjudication tier ships in
-[`llm_denoise.py`](llm_denoise.py) — it uses **Claude Opus 4.8** with adaptive
-thinking, schema-guaranteed structured outputs, neighbour-grounded prompts,
-prompt caching, and abstention.
-
-And [`distill_demo.py`](distill_demo.py) makes the distillation idea concrete: a
-big teacher labels data with soft probabilities, and a **tiny student (~40× fewer
-parameters)** distils it — recovering ~97% of the teacher's accuracy.
+**`distill_demo.py` — knowledge distillation.** A larger model (full 384-d
+embeddings) acts as a teacher and labels data with soft probabilities; a tiny
+linear student (8-d input, ~45 params) trains to imitate it. The student recovers
+~97% of the teacher's accuracy at a fraction of the size. The textbook claim that
+*soft* labels beat *hard* labels only showed up for me once the student was small
+enough to be capacity-limited — on the easy, separable version the two were
+indistinguishable. So: real effect, but smaller and more situational than the
+distillation literature might lead you to expect.
 
 ![distillation](visuals/4_distillation.png)
 
-Finally, [`conformal_demo.py`](conformal_demo.py) adds **trust**: instead of one
-label, it returns a *set* of labels with a coverage guarantee (the true label is
-inside ≥ 90% of the time). Confident messages get a single label; genuinely vague
-ones expand to several — an honest, mathematically-backed "route this to a human."
+**`conformal_demo.py` — conformal prediction.** Instead of one label, it returns
+a *set* with a coverage guarantee (the true label lands in the set at least
+~90% of the time). Confident messages get a single label; the genuinely vague
+ones ("ok", "?") expand to several — which is the honest answer. I used
+randomised APS; plain APS over-covered badly and produced bloated sets on this
+data. Note the coverage runs a bit above target because the base model is
+accurate enough that even small sets cover well.
 
 ![conformal](visuals/5_conformal.png)
 
----
+**`llm_denoise.py` — LLM relabelling.** For the cases k-NN voting can't resolve,
+this sends the message (plus its noisy neighbours as context) to Claude and asks
+for a label with a confidence and an explicit "uncertain" option, using
+structured outputs so the result is always one of the known classes. The point
+isn't to relabel everything with an LLM — that's slow and expensive — but to
+spend it only on the residual the cheap method leaves behind. Requires
+`ANTHROPIC_API_KEY`; without one it just prints what it would do.
 
-## 7. Run it yourself
+## Running it
 
 ```bash
 pip install -r requirements.txt
 
-# Tiers 1 & 4 — the offline consensus pipeline + visuals (no API key needed)
-python clarity_engine.py
+python clarity_engine.py     # label cleaning + training, writes figures to visuals/
+python distill_demo.py       # teacher -> student distillation
+python conformal_demo.py     # conformal prediction sets
 
-# Tier 3 — the LLM adjudicator for the hard residual (needs an API key)
-$env:ANTHROPIC_API_KEY="sk-ant-..."   # PowerShell;  export on macOS/Linux
+# optional, needs a key:
+export ANTHROPIC_API_KEY=...        # PowerShell: $env:ANTHROPIC_API_KEY="..."
 python llm_denoise.py
-
-# Tier 4 — knowledge distillation: big teacher -> tiny student (no API key needed)
-python distill_demo.py
-
-# Tier 5 — conformal prediction: calibrated sets with a coverage guarantee (no API key)
-python conformal_demo.py
 ```
 
-`clarity_engine.py` prints the accuracy comparison and writes three figures to
-`visuals/`. First run downloads a small (~90 MB) embedding model, then works
-offline. `llm_denoise.py` calls the Claude API and prints schema-validated
-verdicts, abstaining on genuinely vague messages.
+First run downloads the ~90 MB embedding model, then everything is offline except
+the LLM script.
 
-**Requirements:** Python 3.9+, numpy, scikit-learn, matplotlib,
-sentence-transformers, anthropic, pydantic.
+Requirements: Python 3.9+, numpy, scikit-learn, matplotlib, sentence-transformers,
+and (for the LLM script) anthropic + pydantic.
+
+## What I'd do differently for real data
+
+- Use a real labelled sample as ground truth instead of synthetic corruption —
+  the whole thing is only as honest as the noise model.
+- Swap exact k-NN for an ANN index (FAISS/hnswlib) once you're past ~100k rows.
+- Cross-check the k-NN cleaning against confident learning (`cleanlab`); trust the
+  rows where both agree, send the disagreements to review or the LLM.
+- Actually measure calibration (ECE), not just accuracy, before trusting any
+  confidence score.
+
+See `ADVANCED.md` for the longer version of these notes.
 
 ---
 
-## 8. Where to take it next
-
-- Use **margin between the top-2 consensus votes** as a smarter confidence signal.
-- Send only the *low-confidence* (genuinely vague) messages to a human — an
-  efficient **active-learning** loop.
-- Replace logistic regression with a **fine-tuned transformer head** for the last
-  few points of accuracy.
-- Add **abstention**: let the model say *"I'm not sure"* instead of guessing.
-
----
-
-Built by [Muhammad Farooqi](https://github.com/mqfarooqi1).
+Muhammad Farooqi · https://github.com/mqfarooqi1
