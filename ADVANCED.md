@@ -174,6 +174,14 @@ Why it wins:
   paraphrases to densify sparse regions and rare intents (LLM augmentation), then
   label those too.
 
+> ▶ **Runnable proof:** [`distill_demo.py`](distill_demo.py) demonstrates this end
+> to end — a big teacher (384-d) labels the pool with temperature-softened soft
+> probabilities, and a tiny student (8-d, **~40× fewer parameters**) distils it,
+> recovering ~97% of the teacher's accuracy. The student trained on **soft** labels
+> edges out an identical student trained on hard labels — the soft distribution
+> carries inter-class "dark knowledge" that a hard argmax throws away. The gap
+> widens as the teacher gets less certain and the student more capacity-limited.
+
 ### 4.3 When you need the last few points: fine-tune a small transformer (LoRA/QLoRA)
 
 If a frozen encoder + head plateaus, fine-tune a small transformer end-to-end on

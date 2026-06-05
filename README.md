@@ -157,6 +157,12 @@ A real, runnable implementation of the LLM adjudication tier ships in
 thinking, schema-guaranteed structured outputs, neighbour-grounded prompts,
 prompt caching, and abstention.
 
+And [`distill_demo.py`](distill_demo.py) makes the distillation idea concrete: a
+big teacher labels data with soft probabilities, and a **tiny student (~40× fewer
+parameters)** distils it — recovering ~97% of the teacher's accuracy.
+
+![distillation](visuals/4_distillation.png)
+
 ---
 
 ## 7. Run it yourself
@@ -170,6 +176,9 @@ python clarity_engine.py
 # Tier 3 — the LLM adjudicator for the hard residual (needs an API key)
 $env:ANTHROPIC_API_KEY="sk-ant-..."   # PowerShell;  export on macOS/Linux
 python llm_denoise.py
+
+# Tier 4 — knowledge distillation: big teacher -> tiny student (no API key needed)
+python distill_demo.py
 ```
 
 `clarity_engine.py` prints the accuracy comparison and writes three figures to
