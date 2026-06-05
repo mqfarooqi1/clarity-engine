@@ -128,22 +128,61 @@ pipeline is the *same one* you would run on millions of real rows:
 
 ---
 
-## 6. Run it yourself
+## 6. Going further: LLM-in-the-loop + the full playbook
 
-```bash
-pip install -r requirements.txt
-python clarity_engine.py
-```
+The consensus method above is the cheap, high-volume layer. The genuinely
+ambiguous residual it can't resolve is where a **frontier LLM** earns its cost —
+not by relabelling everything, but by adjudicating only the hard cases.
 
-It prints the accuracy comparison and writes three figures to `visuals/`.
-First run downloads a small (~90 MB) embedding model, then works offline.
+📚 **[`ADVANCED.md`](ADVANCED.md) is the deep-dive** — the complete modern playbook
+for turning vague data into accurate models and **the best way to use an LLM to
+train for maximum accuracy**, covering:
 
-**Requirements:** Python 3.9+, numpy, scikit-learn, matplotlib,
-sentence-transformers.
+- **Tiered denoising** — semantic consensus → confident learning → LLM adjudication,
+  routing work by difficulty so you only spend LLM budget where it moves accuracy.
+- **LLM-as-judge relabelling** with structured outputs, adaptive thinking,
+  self-consistency, and **calibrated abstention** (the model can say *"I'm unsure"*).
+- **Knowledge distillation** — use a frontier LLM *once, offline, as a teacher* to
+  build a clean training set, then distil it into a small, fast student you serve in
+  production: **LLM-level accuracy at small-model cost.** (This is the headline
+  answer to "what's the best way to train with an LLM.")
+- **LoRA/QLoRA fine-tuning**, **weak supervision** (Snorkel + LLM labelling functions),
+  **temperature-scaling calibration**, and **conformal prediction** (a 95%-coverage
+  guarantee on predictions) for trustworthy, abstaining models.
+- **Scaling**: ANN indexes, GPU batch embedding, the **Batches API** (50% cheaper),
+  and **prompt caching** on the shared taxonomy.
+
+A real, runnable implementation of the LLM adjudication tier ships in
+[`llm_denoise.py`](llm_denoise.py) — it uses **Claude Opus 4.8** with adaptive
+thinking, schema-guaranteed structured outputs, neighbour-grounded prompts,
+prompt caching, and abstention.
 
 ---
 
-## 7. Where to take it next
+## 7. Run it yourself
+
+```bash
+pip install -r requirements.txt
+
+# Tiers 1 & 4 — the offline consensus pipeline + visuals (no API key needed)
+python clarity_engine.py
+
+# Tier 3 — the LLM adjudicator for the hard residual (needs an API key)
+$env:ANTHROPIC_API_KEY="sk-ant-..."   # PowerShell;  export on macOS/Linux
+python llm_denoise.py
+```
+
+`clarity_engine.py` prints the accuracy comparison and writes three figures to
+`visuals/`. First run downloads a small (~90 MB) embedding model, then works
+offline. `llm_denoise.py` calls the Claude API and prints schema-validated
+verdicts, abstaining on genuinely vague messages.
+
+**Requirements:** Python 3.9+, numpy, scikit-learn, matplotlib,
+sentence-transformers, anthropic, pydantic.
+
+---
+
+## 8. Where to take it next
 
 - Use **margin between the top-2 consensus votes** as a smarter confidence signal.
 - Send only the *low-confidence* (genuinely vague) messages to a human — an
